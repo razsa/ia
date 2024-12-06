@@ -1,0 +1,9 @@
+{{range .}}
+<div class="search-result">
+    <h2>{{._source.Title}}</h2>
+    <p>{{truncate ._source.content 200}}</p>
+    <a href="{{._source.URL}}">Read more</a>
+</div>
+{{else}}
+<p>No results found.</p>
+{{end}}
