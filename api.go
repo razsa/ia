@@ -205,7 +205,7 @@ func connectElasticsearch() (*elasticsearch.Client, error) {
 			elasticsearch.Config{
 				Addresses: []string{elasticURL},
 				Username:  "elastic",
-				Password:  "=TqLInd1UL44AL49kmVm",
+				Password:  "password",
 				Transport: httpClient.Transport,
 			},
 		)
