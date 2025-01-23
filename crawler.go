@@ -4,11 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
+	"io"
 	"log"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/elastic/go-elasticsearch/v8"
 	"github.com/elastic/go-elasticsearch/v8/esapi"
@@ -18,11 +17,6 @@ import (
 
 // Crawl starts the web crawling process.  It takes the database and Elasticsearch client as parameters.
 func Crawl(db *sql.DB, es *elasticsearch.Client, startURL string) error {
-	// Ensure index exists before starting
-	if err := ensureIndexExists(es); err != nil {
-		return fmt.Errorf("failed to create index: %v", err)
-	}
-
 	c := colly.NewCollector()
 
 	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
@@ -42,39 +36,42 @@ func Crawl(db *sql.DB, es *elasticsearch.Client, startURL string) error {
 
 		absURL = baseURL.ResolveReference(absURL) // Now this works correctly
 
-		_, err = db.Exec("INSERT INTO crawl_queue (url) VALUES ($1)", absURL.String())
+		_, err = db.Exec("INSERT INTO crawl_queue (url) VALUES ($1) ON CONFLICT (url) DO NOTHING", absURL.String())
 		if err != nil {
 			log.Printf("Error inserting '%s' into queue: %v", absURL.String(), err)
 		}
+
 	})
 
 	c.OnResponse(func(r *colly.Response) {
-		// Create a URL-safe document ID
-		docID := url.QueryEscape(r.Request.URL.String())
+		// Create a new context for the request
+		ctx := context.Background()
 
-		// Create a structured document
-		doc := map[string]interface{}{
-			"url":       r.Request.URL.String(),
-			"content":   string(r.Body),
-			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		// Create a document ID (you might want to generate this differently)
+		// docID := r.Request.URL.String()
+
+		// Create the document data
+		data := map[string]interface{}{
+			"url":     r.Request.URL.String(),
+			"content": string(r.Body),
 		}
 
-		// Convert document to JSON
-		docJSON, err := json.Marshal(doc)
+		// Create the request body
+		body, err := json.Marshal(data)
 		if err != nil {
 			log.Printf("Error marshaling document: %v", err)
 			return
 		}
 
-		// Create index request
+		// Perform the index request
 		req := esapi.IndexRequest{
-			Index:      "pages",
-			DocumentID: docID,
-			Body:       strings.NewReader(string(docJSON)),
-			Refresh:    "true",
+			Index:   "pages",
+			Body:    strings.NewReader(string(body)),
+			Refresh: "true",
+			// DocumentID: docID,
 		}
 
-		res, err := req.Do(context.Background(), es)
+		res, err := req.Do(ctx, es)
 		if err != nil {
 			log.Printf("Error indexing page '%s': %v", r.Request.URL.String(), err)
 			return
@@ -82,19 +79,17 @@ func Crawl(db *sql.DB, es *elasticsearch.Client, startURL string) error {
 		defer res.Body.Close()
 
 		if res.IsError() {
-			var e map[string]interface{}
-			if err := json.NewDecoder(res.Body).Decode(&e); err != nil {
-				log.Printf("Error parsing error response: %v", err)
-				return
+			// Read the response body for detailed error
+			bodyBytes, err := io.ReadAll(res.Body)
+			if err != nil {
+				log.Printf("Error reading Elasticsearch error response: %v", err)
+			} else {
+				log.Printf("Indexing failed with status code %d", res.StatusCode, string(bodyBytes))
 			}
-			log.Printf("Error indexing document: %v", e)
-			return
 		}
-
-		log.Printf("Successfully indexed page '%s'", r.Request.URL.String())
 	})
 
-	// Error Handling for Visit
+	//Error Handling for Visit
 	err := c.Visit(startURL)
 	if err != nil {
 		return err
