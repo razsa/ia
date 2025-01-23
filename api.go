@@ -2,18 +2,16 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"time"
+
+	"encoding/json"
 
 	"github.com/elastic/go-elasticsearch/v8"
 	"github.com/elastic/go-elasticsearch/v8/esapi"
@@ -42,7 +40,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to connect to Elasticsearch: %v", err)
 	}
-
+	// Removed esClient.Stop() as it is not defined in the new elasticsearch.Client
 	e := echo.New()
 	setupAPI(e, db, esClient)
 	e.Logger.Fatal(e.Start(":1323"))
@@ -63,6 +61,20 @@ func setupAPI(e *echo.Echo, db *sql.DB, es *elasticsearch.Client) {
 	e.Renderer = t
 
 	// Define routes
+	e.POST("/crawl", func(c echo.Context) error {
+		url := c.FormValue("url")
+		if url == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "URL is required"})
+		}
+
+		err := Crawl(db, es, url)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+
+		return c.JSON(http.StatusOK, map[string]string{"message": "Crawling started"})
+	})
+
 	e.GET("/", func(c echo.Context) error {
 		return c.Render(http.StatusOK, "index.html", nil)
 	})
@@ -70,111 +82,37 @@ func setupAPI(e *echo.Echo, db *sql.DB, es *elasticsearch.Client) {
 	e.GET("/search", func(c echo.Context) error {
 		query := c.QueryParam("q")
 		if query == "" {
-			return c.Render(http.StatusOK, "search_results.html", nil)
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "search query is required"})
 		}
 
 		var b esapi.SearchRequest
 		b = esapi.SearchRequest{
 			Index: []string{"pages"},
-			Body:  strings.NewReader(fmt.Sprintf(`{"query":{"multi_match":{"query":"%s","fields":["title","content"]}}}`, query)),
+			Query: "{\"multi_match\":{\"query\":\"" + query + "\",\"fields\":[\"title\",\"content\"]}}",
 		}
+
 		result, err := b.Do(context.Background(), es)
 		if err != nil {
-			log.Printf("Error performing search: %v", err)
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
 		defer result.Body.Close()
 
-		if result.IsError() {
-			var e map[string]interface{}
-			if err := json.NewDecoder(result.Body).Decode(&e); err != nil {
-				log.Printf("Error parsing error response: %v", err)
-				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Error parsing Elasticsearch response"})
-			}
-			log.Printf("Elasticsearch error: %v", e)
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("%v", e["error"])})
-		}
-
 		var r map[string]interface{}
 		if err := json.NewDecoder(result.Body).Decode(&r); err != nil {
-			log.Printf("Error parsing the response body: %v", err)
+			log.Printf("Error parsing the response body: %s", err)
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to parse response"})
 		}
 
-		hitsObj, exists := r["hits"].(map[string]interface{})
-		if !exists {
-			log.Printf("No hits object in response: %v", r)
-			return c.Render(http.StatusOK, "search_results.html", []interface{}{})
+		// Safely check if hits exists and is a map
+		if hits, ok := r["hits"].(map[string]interface{}); ok {
+			if hitsResult, ok := hits["hits"].([]interface{}); ok {
+				return c.Render(http.StatusOK, "search_results.html", hitsResult)
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Invalid hits structure"})
 		}
 
-		hits, exists := hitsObj["hits"].([]interface{})
-		if !exists {
-			log.Printf("No hits array in response: %v", hitsObj)
-			return c.Render(http.StatusOK, "search_results.html", []interface{}{})
-		}
-
-		return c.Render(http.StatusOK, "search_results.html", hits)
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to get hits from response"})
 	})
-
-	e.POST("/start-crawler", func(c echo.Context) error {
-		// Ensure index exists
-		if err := ensureIndexExists(es); err != nil {
-			log.Printf("Failed to create index: %v", err)
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to create index"})
-		}
-
-		// Start the crawler with a default URL (you can make this configurable via query parameter)
-		go func() {
-			startURL := "https://example.com" // Replace with your desired start URL
-			if err := Crawl(db, es, startURL); err != nil {
-				log.Printf("Crawler error: %v", err)
-			}
-		}()
-
-		return c.JSON(http.StatusOK, map[string]string{"message": "Crawler started"})
-	})
-}
-
-func ensureIndexExists(es *elasticsearch.Client) error {
-	// Create the index if it doesn't exist
-	indexName := "pages"
-	res, err := es.Indices.Exists([]string{indexName})
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-
-	// StatusCode 404 means index doesn't exist
-	if res.StatusCode == 404 {
-		// Create the index with a mapping
-		mapping := `{
-			"mappings": {
-				"properties": {
-					"url": {"type": "text"},
-					"title": {"type": "text"},
-					"content": {"type": "text"}
-				}
-			}
-		}`
-		req := esapi.IndicesCreateRequest{
-			Index: indexName,
-			Body:  strings.NewReader(mapping),
-		}
-		res, err := req.Do(context.Background(), es)
-		if err != nil {
-			return err
-		}
-		defer res.Body.Close()
-
-		if res.IsError() {
-			var e map[string]interface{}
-			if err := json.NewDecoder(res.Body).Decode(&e); err != nil {
-				return err
-			}
-			return fmt.Errorf("Failed to create index: %v", e)
-		}
-	}
-	return nil
 }
 
 func connectElasticsearch() (*elasticsearch.Client, error) {
@@ -183,30 +121,17 @@ func connectElasticsearch() (*elasticsearch.Client, error) {
 
 	elasticURL := os.Getenv("ELASTICSEARCH_URL")
 	if elasticURL == "" {
-		elasticURL = "https://localhost:9200"
+		elasticURL = "http://localhost:9200"
 	}
-
-	// Load the CA certificate
-	caCert, err := os.ReadFile("http_ca.crt")
-	if err != nil {
-		return nil, fmt.Errorf("failed to read CA certificate: %v", err)
-	}
-	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
-
-	// Configure the Elasticsearch client to use HTTPS and the CA certificate
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{RootCAs: caCertPool},
-	}
-	httpClient := &http.Client{Transport: transport}
 
 	for i := 0; i < retries; i++ {
 		client, err := elasticsearch.NewClient(
 			elasticsearch.Config{
 				Addresses: []string{elasticURL},
-				Username:  "elastic",
-				Password:  "password",
-				Transport: httpClient.Transport,
+				// Remove MaxRetries from the config
+				// MaxRetries: 5,
+				// Remove RetryOnStatus from the config
+				// RetryOnStatus: []int{502, 503, 504},
 			},
 		)
 		if err != nil {
@@ -216,35 +141,22 @@ func connectElasticsearch() (*elasticsearch.Client, error) {
 			continue
 		}
 
-		// Health check to ensure Elasticsearch is ready
-		for j := 0; j < 10; j++ {
-			res, err := client.Cluster.Health(client.Cluster.Health.WithContext(context.Background()))
-			if err != nil {
-				fmt.Printf("Error checking Elasticsearch health (attempt %d): %v\n", j+1, err)
-				time.Sleep(2 * time.Second)
-				continue
-			}
-			defer res.Body.Close()
-
-			if res.StatusCode == http.StatusOK {
-				var responseBody map[string]interface{}
-				if err := json.NewDecoder(res.Body).Decode(&responseBody); err != nil {
-					fmt.Printf("Error decoding Elasticsearch health response (attempt %d): %v\n", j+1, err)
-					time.Sleep(2 * time.Second)
-					continue
-				}
-
-				status := responseBody["status"].(string)
-				if status == "green" || status == "yellow" {
-					fmt.Println("Elasticsearch is healthy and ready")
-					return client, nil
-				}
-			}
+		// Ping the Elasticsearch server to get e.g. the version number
+		_, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		info, err := client.Info()
+		if err != nil {
+			fmt.Printf("Error pinging Elasticsearch (attempt %d): %v\n", i+1, err)
+			lastErr = err
+			time.Sleep(5 * time.Second)
+			continue
 		}
 
-		fmt.Printf("Elasticsearch not ready after health checks (attempt %d)\n", i+1)
-		lastErr = fmt.Errorf("Elasticsearch not ready")
-		time.Sleep(5 * time.Second)
+		var responseBody map[string]interface{}
+		json.NewDecoder(info.Body).Decode(&responseBody)
+		version := responseBody["version"].(map[string]interface{})["number"].(string)
+		fmt.Printf("Elasticsearch returned with version %s\n", version)
+		return client, nil
 	}
 
 	return nil, fmt.Errorf("failed to connect to Elasticsearch after %d attempts: %v", retries, lastErr)
