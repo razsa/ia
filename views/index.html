@@ -7,6 +7,12 @@
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
 </head>
 <body>
+    <h1>Start Crawling</h1>
+<form hx-post="/crawl" hx-target="#crawl-status">
+    <input type="text" name="url" placeholder="Enter URL to crawl">
+    <button type="submit">Start Crawling</button>
+</form>
+<div id="crawl-status"></div>
     <h1>Web Crawler Search</h1>
     <form hx-get="/search" hx-target="#search-results" hx-trigger="submit, input delay:500ms">
         <input type="text" name="q" placeholder="Enter search query">
